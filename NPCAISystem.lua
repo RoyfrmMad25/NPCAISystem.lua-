@@ -1,6 +1,6 @@
 --[[
 	NPCAISystem.lua
-	Author: [Your Name]
+	
 
 	A modular NPC AI controller built with object-oriented Luau using metatables.
 	Each NPC instance manages its own state machine, pathfinding, CFrame-based
