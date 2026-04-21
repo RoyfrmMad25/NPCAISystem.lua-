@@ -1,0 +1,630 @@
+--[[
+	NPCAISystem.lua
+	Author: [Your Name]
+
+	A modular NPC AI controller built with object-oriented Luau using metatables.
+	Each NPC instance manages its own state machine, pathfinding, CFrame-based
+	orientation, physics ragdoll, and awareness detection independently.
+
+	Architecture overview:
+	  - NPCController class (metatable-based OOP) owns all per-NPC logic
+	  - A shared AIManager table handles spawning and global tick updates
+	  - States drive behaviour: Idle → Patrol → Chase → Attack → Ragdoll
+	  - CFrame math handles smooth head-turning and root orientation
+	  - Physics constraints are toggled on-demand for ragdoll simulation
+]]
+
+-- [Services]
+
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
+local CollectionService  = game:GetService("CollectionService")
+local Debris             = game:GetService("Debris")
+
+-- [Constants]
+
+-- Tuning values are grouped here so designers can adjust behaviour
+-- without hunting through the logic below.
+local CONFIG = {
+	PATROL_RADIUS     = 20,   -- how far from spawn the NPC wanders
+	DETECT_RADIUS     = 30,   -- sphere radius for player awareness
+	ATTACK_RADIUS     = 5,    -- melee reach
+	CHASE_SPEED       = 16,   -- walkspeed while chasing
+	PATROL_SPEED      = 8,    -- walkspeed while patrolling
+	ATTACK_COOLDOWN   = 1.2,  -- seconds between hits
+	ATTACK_DAMAGE     = 15,
+	RAGDOLL_DURATION  = 4,    -- seconds before the NPC recovers
+	WAYPOINT_REACH    = 3,    -- distance at which a waypoint is considered reached
+	HEAD_TURN_ALPHA   = 0.12, -- CFrame slerp speed for smooth head rotation
+	PATH_RECOMPUTE    = 1.5,  -- seconds between path recalculations while chasing
+	IDLE_WANDER_MIN   = 3,    -- minimum seconds spent idle before picking new patrol point
+	IDLE_WANDER_MAX   = 7,
+}
+
+-- States are string constants. Using a table prevents typos from
+-- silently creating new states at runtime.
+local STATE = {
+	IDLE    = "Idle",
+	PATROL  = "Patrol",
+	CHASE   = "Chase",
+	ATTACK  = "Attack",
+	RAGDOLL = "Ragdoll",
+	DEAD    = "Dead",
+}
+
+-- [Utility]
+
+-- Returns the closest Character model belonging to any Player, or nil.
+-- We iterate Players instead of workspace descendants for reliability
+-- and to avoid detecting ragdolled / dead characters.
+local function getNearestPlayer(origin: Vector3, maxDist: number): (Model?, number)
+	local best: Model?  = nil
+	local bestDist      = maxDist
+
+	for _, player in Players:GetPlayers() do
+		local char = player.Character
+		if not char then continue end
+		local root = char:FindFirstChild("HumanoidRootPart")
+		if not root then continue end
+
+		local humanoid = char:FindFirstChildOfClass("Humanoid")
+		if not humanoid or humanoid.Health <= 0 then continue end
+
+		local dist = (root.Position - origin).Magnitude
+		if dist < bestDist then
+			bestDist = dist
+			best     = char
+		end
+	end
+
+	return best, bestDist
+end
+
+-- Picks a random point on the XZ plane within a radius of `center`.
+-- The Y component is kept from `center` so the point stays on the
+-- same elevation; PathfindingService will handle vertical adjustment.
+local function randomPatrolPoint(center: Vector3, radius: number): Vector3
+	local angle  = math.random() * math.pi * 2
+	local dist   = math.random() * radius
+	return Vector3.new(
+		center.X + math.cos(angle) * dist,
+		center.Y,
+		center.Z + math.sin(angle) * dist
+	)
+end
+
+-- Linearly interpolates a number — used for health bar scaling.
+local function lerp(a: number, b: number, t: number): number
+	return a + (b - a) * t
+end
+
+-- [NPCController]
+--[[
+	NPCController uses Luau's __index metatable pattern to give every
+	instance access to shared methods without duplicating them in memory.
+	Creating an NPC: local npc = NPCController.new(model)
+]]
+
+local NPCController     = {}
+NPCController.__index   = NPCController   -- instances inherit from this table
+
+-- Constructor — initialises all per-instance state.
+-- `model` must have: HumanoidRootPart, Humanoid, Head, and a rig body.
+function NPCController.new(model: Model): table
+	local self = setmetatable({}, NPCController)
+
+	-- Core references
+	self.model    = model
+	self.humanoid = model:FindFirstChildOfClass("Humanoid")
+	self.rootPart = model:FindFirstChild("HumanoidRootPart")
+	self.head     = model:FindFirstChild("Head")
+
+	-- Validate that the model is usable before we do anything else.
+	-- Returning nil lets the manager skip broken models gracefully.
+	if not self.humanoid or not self.rootPart or not self.head then
+		warn("NPCController: model", model.Name, "is missing required parts.")
+		return nil
+	end
+
+	-- Spawn position is stored so patrol points stay near the origin.
+	self.spawnPos         = self.rootPart.Position
+
+	-- State machine
+	self.state            = STATE.IDLE
+	self.target           = nil     -- current player Character being chased
+
+	-- Pathfinding
+	self.path             = nil
+	self.waypoints        = {}
+	self.waypointIndex    = 1
+	self.lastPathTime     = 0
+
+	-- Timers
+	self.attackCooldown   = 0
+	self.ragdollTimer     = 0
+	self.idleTimer        = math.random(CONFIG.IDLE_WANDER_MIN, CONFIG.IDLE_WANDER_MAX)
+
+	-- Ragdoll: we store references to every Motor6D so we can toggle them.
+	-- Disabling Motor6Ds lets Roblox's physics engine take over the joints,
+	-- which produces convincing ragdoll behaviour without extra plugins.
+	self.motors           = {}
+	self.ballSockets      = {}   -- BallSocketConstraints we create for ragdoll
+	self._ragdollPrepared = false
+
+	-- Head rotation: we track a target CFrame separately so we can slerp
+	-- smoothly toward it each frame rather than snapping.
+	self.headTargetCF     = self.head.CFrame
+
+	-- Humanoid configuration
+	self.humanoid.WalkSpeed      = CONFIG.PATROL_SPEED
+	self.humanoid.AutoRotate     = true
+
+	-- Bind death handler so the state machine reacts to zero health.
+	self.humanoid.Died:Connect(function()
+		self:setState(STATE.DEAD)
+		self:applyRagdoll(true)
+		-- Clean up after a delay rather than destroying immediately so the
+		-- ragdoll has time to settle visually before disappearing.
+		Debris:AddItem(self.model, 6)
+	end)
+
+	return self
+end
+
+-- [State Machine]
+
+-- Central state transition. Using a dedicated function (rather than
+-- setting self.state directly) makes it easy to add enter/exit hooks
+-- and keeps transitions auditable from one place.
+function NPCController:setState(newState: string)
+	if self.state == newState then return end
+
+	-- Exit logic for the previous state
+	if self.state == STATE.CHASE then
+		-- Stop the current path so the NPC doesn't ghost-follow a waypoint
+		-- after returning to patrol.
+		self.humanoid:MoveTo(self.rootPart.Position)
+	end
+
+	self.state  = newState
+	self.target = (newState == STATE.CHASE or newState == STATE.ATTACK)
+		and self.target
+		or nil
+
+	-- Enter logic for the new state
+	if newState == STATE.PATROL then
+		self.humanoid.WalkSpeed = CONFIG.PATROL_SPEED
+		self:pickPatrolPoint()
+	elseif newState == STATE.CHASE then
+		self.humanoid.WalkSpeed = CONFIG.CHASE_SPEED
+	elseif newState == STATE.IDLE then
+		self.humanoid:MoveTo(self.rootPart.Position)
+		self.idleTimer = math.random(CONFIG.IDLE_WANDER_MIN, CONFIG.IDLE_WANDER_MAX)
+	end
+end
+
+-- [Patrol]
+
+-- Generates a fresh patrol destination and starts navigation.
+function NPCController:pickPatrolPoint()
+	local destination = randomPatrolPoint(self.spawnPos, CONFIG.PATROL_RADIUS)
+	-- Snap Y to a sensible value so the NPC doesn't try to walk into the air.
+	destination = Vector3.new(destination.X, self.rootPart.Position.Y, destination.Z)
+	self:navigateTo(destination)
+end
+
+-- [Pathfinding]
+
+-- Requests a new path and begins following it.
+-- We use PathfindingService rather than simple MoveTo calls so the NPC
+-- can navigate around obstacles instead of walking into walls.
+function NPCController:navigateTo(target: Vector3)
+	-- Throttle recomputation: recomputing every frame is expensive.
+	local now = os.clock()
+	if now - self.lastPathTime < CONFIG.PATH_RECOMPUTE then return end
+	self.lastPathTime = now
+
+	local newPath = PathfindingService:CreatePath({
+		AgentRadius        = 2,
+		AgentHeight        = 5,
+		AgentCanJump       = true,
+		AgentCanClimb      = false,
+		WaypointSpacing    = 4,
+	})
+
+	local success, err = pcall(function()
+		newPath:ComputeAsync(self.rootPart.Position, target)
+	end)
+
+	if not success or newPath.Status ~= Enum.PathStatus.Success then
+		-- Path failed — fall back to a direct MoveTo and try again next tick.
+		self.humanoid:MoveTo(target)
+		return
+	end
+
+	self.path          = newPath
+	self.waypoints     = newPath:GetWaypoints()
+	self.waypointIndex = 2   -- index 1 is the NPC's own position; skip it
+
+	self:advanceWaypoint()
+end
+
+-- Moves the NPC toward the next waypoint in the path.
+function NPCController:advanceWaypoint()
+	if not self.waypoints or self.waypointIndex > #self.waypoints then return end
+
+	local wp = self.waypoints[self.waypointIndex]
+
+	if wp.Action == Enum.PathWaypointAction.Jump then
+		self.humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+
+	self.humanoid:MoveTo(wp.Position)
+end
+
+-- Called each update; checks whether the NPC has reached its current
+-- waypoint and should step to the next one.
+function NPCController:updateWaypoints()
+	if not self.waypoints or self.waypointIndex > #self.waypoints then return end
+
+	local wp   = self.waypoints[self.waypointIndex]
+	local dist = (self.rootPart.Position - wp.Position).Magnitude
+
+	if dist <= CONFIG.WAYPOINT_REACH then
+		self.waypointIndex += 1
+		self:advanceWaypoint()
+	end
+end
+
+-- [Head Rotation]
+
+-- Points the NPC's head toward `lookTarget` using CFrame slerp.
+-- This produces a smooth head-turning effect without using animations.
+-- The key insight: we construct a CFrame that looks at the target,
+-- then blend toward it each frame using lerp on the quaternion component.
+function NPCController:updateHeadLook(lookTarget: Vector3, dt: number)
+	if not self.head then return end
+
+	local headPos    = self.head.CFrame.Position
+	local targetCF   = CFrame.lookAt(headPos, Vector3.new(
+		lookTarget.X,
+		headPos.Y,   -- keep vertical angle neutral; avoids the NPC craning its neck
+		lookTarget.Z
+	))
+
+	-- CFrame.lookAt gives us orientation only; we re-anchor to the head's
+	-- actual world position so the head doesn't wander.
+	self.headTargetCF = targetCF
+
+	-- Slerp: the alpha drives how quickly the head catches up.
+	-- Lower alpha = slower turn, higher = snappier.
+	local alpha = math.min(1, CONFIG.HEAD_TURN_ALPHA * (dt / (1/60)))
+	self.head.CFrame = self.head.CFrame:Lerp(self.headTargetCF, alpha)
+end
+
+-- [Attack]
+
+function NPCController:tryAttack(dt: number)
+	self.attackCooldown -= dt
+	if self.attackCooldown > 0 then return end
+	if not self.target    then return end
+
+	local targetRoot = self.target:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return end
+
+	local dist = (self.rootPart.Position - targetRoot.Position).Magnitude
+	if dist > CONFIG.ATTACK_RADIUS then return end
+
+	local targetHum = self.target:FindFirstChildOfClass("Humanoid")
+	if targetHum and targetHum.Health > 0 then
+		targetHum:TakeDamage(CONFIG.ATTACK_DAMAGE)
+	end
+
+	self.attackCooldown = CONFIG.ATTACK_COOLDOWN
+
+	-- Visual feedback: a quick scale punch on the NPC's arm to imply a swing.
+	-- This avoids requiring a dedicated animation asset.
+	local arm = self.model:FindFirstChild("RightLowerArm")
+		or self.model:FindFirstChild("Right Arm")
+	if arm then
+		local original = arm.Size
+		arm.Size = original * Vector3.new(1, 1.3, 1)
+		task.delay(0.08, function()
+			if arm and arm.Parent then
+				arm.Size = original
+			end
+		end)
+	end
+end
+
+-- [Ragdoll]
+
+-- Pre-caches all Motor6D joints so toggling ragdoll is O(n) not O(n²).
+-- Called lazily on first ragdoll trigger to avoid setup cost at spawn.
+function NPCController:prepareRagdoll()
+	if self._ragdollPrepared then return end
+
+	for _, desc in self.model:GetDescendants() do
+		if desc:IsA("Motor6D") then
+			table.insert(self.motors, desc)
+
+			-- For each joint we create a BallSocketConstraint attached to the
+			-- same parts. When the motor is disabled the constraint keeps the
+			-- limbs loosely together instead of flying off into space.
+			local a0 = Instance.new("Attachment")
+			local a1 = Instance.new("Attachment")
+			a0.Parent = desc.Part0
+			a1.Parent = desc.Part1
+
+			-- Position the attachments at the joint's C0/C1 offsets so the
+			-- constraint pivot matches the skeleton joint precisely.
+			a0.CFrame = desc.C0
+			a1.CFrame = desc.C1
+
+			local bsc             = Instance.new("BallSocketConstraint")
+			bsc.Attachment0       = a0
+			bsc.Attachment1       = a1
+			bsc.LimitsEnabled     = true
+			bsc.TwistLimitsEnabled = true
+			bsc.UpperAngle        = 45   -- degrees of freedom per axis
+			bsc.TwistUpperAngle   = 45
+			bsc.Parent            = desc.Part0
+
+			table.insert(self.ballSockets, bsc)
+		end
+	end
+
+	self._ragdollPrepared = true
+end
+
+-- Enables or disables ragdoll physics by toggling Motor6Ds.
+-- When motors are off, Roblox treats the joints as free and the
+-- BallSocketConstraints take over, giving controlled floppy physics.
+function NPCController:applyRagdoll(enable: boolean)
+	self:prepareRagdoll()
+
+	for _, motor in self.motors do
+		if motor and motor.Parent then
+			motor.Enabled = not enable
+		end
+	end
+
+	-- Disable movement so the humanoid doesn't fight the physics sim.
+	if enable then
+		self.humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+		self.humanoid.PlatformStand = true
+	else
+		self.humanoid.PlatformStand = false
+		self.humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end
+end
+
+-- Public hit receiver — other scripts call this to stagger the NPC.
+-- e.g. from a weapon's hit detection, or an explosion.
+function NPCController:onHit(impulseDirection: Vector3?)
+	if self.state == STATE.DEAD then return end
+
+	self:setState(STATE.RAGDOLL)
+	self:applyRagdoll(true)
+	self.ragdollTimer = CONFIG.RAGDOLL_DURATION
+
+	-- Apply an optional physics impulse to send the NPC flying in a direction.
+	-- This is purely cosmetic and makes projectile hits feel impactful.
+	if impulseDirection and self.rootPart then
+		local force = Instance.new("VectorForce")
+		force.ApplyAtCenterOfMass = true
+		force.RelativeTo = Enum.ActuatorRelativeTo.World
+		force.Force = impulseDirection.Unit * 8000
+
+		local att = Instance.new("Attachment", self.rootPart)
+		force.Attachment0 = att
+		force.Parent = self.rootPart
+		Debris:AddItem(force, 0.05)   -- short pulse, then remove
+		Debris:AddItem(att,   0.05)
+	end
+end
+
+-- [Update]
+
+-- Main update called by AIManager every RunService.Heartbeat.
+-- `dt` is the delta time since the last frame.
+function NPCController:update(dt: number)
+	if self.state == STATE.DEAD then return end
+
+-- ragdoll recovery
+	if self.state == STATE.RAGDOLL then
+		self.ragdollTimer -= dt
+		if self.ragdollTimer <= 0 then
+			self:applyRagdoll(false)
+			self:setState(STATE.IDLE)
+		end
+		return   -- no other logic runs while ragdolled
+	end
+
+-- awareness scan
+	-- Only scan every few frames (staggered by instance creation time mod)
+	-- to spread the cost across multiple NPCs over multiple frames.
+	local nearestPlayer, nearestDist = getNearestPlayer(
+		self.rootPart.Position,
+		CONFIG.DETECT_RADIUS
+	)
+
+-- state transitions based on awareness
+	if nearestPlayer then
+		self.target = nearestPlayer
+
+		if nearestDist <= CONFIG.ATTACK_RADIUS then
+			if self.state ~= STATE.ATTACK then
+				self:setState(STATE.ATTACK)
+			end
+		elseif self.state ~= STATE.CHASE and self.state ~= STATE.ATTACK then
+			self:setState(STATE.CHASE)
+		end
+	else
+		-- Lost sight of target
+		if self.state == STATE.CHASE or self.state == STATE.ATTACK then
+			self:setState(STATE.IDLE)
+		end
+	end
+
+-- per-state behaviour
+	if self.state == STATE.IDLE then
+		self.idleTimer -= dt
+		if self.idleTimer <= 0 then
+			self:setState(STATE.PATROL)
+		end
+
+	elseif self.state == STATE.PATROL then
+		self:updateWaypoints()
+		-- If waypoints exhausted, return to idle so a new patrol point is chosen.
+		if self.waypointIndex > #self.waypoints then
+			self:setState(STATE.IDLE)
+		end
+
+	elseif self.state == STATE.CHASE then
+		if self.target then
+			local targetRoot = self.target:FindFirstChild("HumanoidRootPart")
+			if targetRoot then
+				self:navigateTo(targetRoot.Position)
+				self:updateWaypoints()
+				self:updateHeadLook(targetRoot.Position, dt)
+			end
+		end
+
+	elseif self.state == STATE.ATTACK then
+		if self.target then
+			local targetRoot = self.target:FindFirstChild("HumanoidRootPart")
+			if targetRoot then
+				-- Face the target directly using CFrame lookAt on the root.
+				-- We only rotate on the Y axis (lock pitch) to keep the NPC upright.
+				local lookPos = Vector3.new(
+					targetRoot.Position.X,
+					self.rootPart.Position.Y,
+					targetRoot.Position.Z
+				)
+				self.rootPart.CFrame = CFrame.lookAt(
+					self.rootPart.Position,
+					lookPos
+				)
+				self:updateHeadLook(targetRoot.Position, dt)
+			end
+		end
+		self:tryAttack(dt)
+	end
+end
+
+-- [Cleanup]
+
+-- Explicit destructor so the AIManager can remove the instance cleanly.
+-- Without this, the coroutine reference would keep the table alive.
+function NPCController:destroy()
+	self.state  = STATE.DEAD
+	self.target = nil
+	-- Connections made inside new() are cleaned up automatically when
+	-- the model is destroyed via Debris or manually.
+end
+
+-- [AIManager]
+--[[
+	The AIManager is a thin coordinator that owns a list of active
+	NPCController instances and drives their update loops.
+
+	It is intentionally separate from NPCController so the class can be
+	reused by other systems (e.g. a BossController that extends it) without
+	coupling to a specific manager.
+]]
+
+local AIManager = {}
+AIManager._npcs = {}
+
+-- Spawns an NPC from a server-side model template stored in ServerStorage.
+-- Returns the controller instance so callers can register hit events, etc.
+function AIManager.spawnNPC(template: Model, position: Vector3): table?
+	local model: Model = template:Clone()
+	model:PivotTo(CFrame.new(position))
+	model.Parent = workspace
+
+	local controller = NPCController.new(model)
+	if not controller then
+		model:Destroy()
+		return nil
+	end
+
+	table.insert(AIManager._npcs, controller)
+
+	-- Tag the model with CollectionService so external systems (e.g. a
+	-- game manager that needs all active NPCs) can query them easily.
+	CollectionService:AddTag(model, "ActiveNPC")
+
+	return controller
+end
+
+-- Removes a controller from the active list and cleans it up.
+function AIManager.removeNPC(controller: table)
+	for i, npc in AIManager._npcs do
+		if npc == controller then
+			npc:destroy()
+			table.remove(AIManager._npcs, i)
+			CollectionService:RemoveTag(npc.model, "ActiveNPC")
+			break
+		end
+	end
+end
+
+-- Returns all live controller instances — useful for events that affect
+-- every NPC (e.g. an area explosion, a global stagger).
+function AIManager.getAll(): {table}
+	return AIManager._npcs
+end
+
+-- [Heartbeat Loop]
+--[[
+	We bind to Heartbeat (not RenderStepped) because AI logic is physics-
+	adjacent and should run at the physics rate, not the render rate.
+	RenderStepped is reserved for camera and visual updates.
+]]
+
+RunService.Heartbeat:Connect(function(dt: number)
+	-- Iterate backwards so we can safely remove dead NPCs in-place.
+	for i = #AIManager._npcs, 1, -1 do
+		local npc = AIManager._npcs[i]
+		if npc.state == STATE.DEAD or not npc.model.Parent then
+			table.remove(AIManager._npcs, i)
+		else
+			npc:update(dt)
+		end
+	end
+end)
+
+-- [Bootstrap]
+--[[
+	Auto-spawn any NPC models already present in the workspace that are
+	tagged "NPCSpawn". This lets level designers place NPCs in Studio
+	without writing extra Scripts.
+
+	For dynamically spawned NPCs (e.g. wave events) call AIManager.spawnNPC()
+	directly from another Script.
+]]
+
+local function initWorkspaceNPCs()
+	for _, model in CollectionService:GetTagged("NPCSpawn") do
+		if model:IsA("Model") then
+			AIManager.spawnNPC(model, model:GetPivot().Position)
+		end
+	end
+end
+
+-- Also listen for NPCs added at runtime (e.g. streamed in or spawned by events).
+CollectionService:GetInstanceAddedSignal("NPCSpawn"):Connect(function(model)
+	if model:IsA("Model") then
+		task.defer(function()
+			AIManager.spawnNPC(model, model:GetPivot().Position)
+		end)
+	end
+end)
+
+initWorkspaceNPCs()
+
+-- Export the manager so other Scripts can call AIManager.spawnNPC() etc.
+return AIManager
